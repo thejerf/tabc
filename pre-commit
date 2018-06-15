@@ -1,0 +1,18 @@
+#!/bin/bash
+
+# This ensures all executables build and all tests pass before a commit
+# goes through.
+
+set -e
+
+trap "echo; echo BUILD CHECK FAILED - NO COMMIT; echo; echo" ERR
+
+go test 
+
+echo
+echo Build succeeds.
+echo
+echo
+
+exit 0
+
