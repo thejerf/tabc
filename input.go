@@ -11,6 +11,16 @@ type timedInput struct {
 	time  time.Time
 }
 
+func (ti timedInput) Split(idx int) (timedInput, timedInput) {
+	return timedInput{
+			ti.input[:idx],
+			ti.time,
+		}, timedInput{
+			ti.input[idx:],
+			ti.time,
+		}
+}
+
 // Consolidated is what comes out from a Consolidator. It has the full
 // stream of bytes received (no bytes will be elided), the start time of
 // this chunk of bytes, and individual offsets from that time for each
@@ -27,8 +37,7 @@ type Consolidated struct {
 // the second value, to indicate that there was no input to convert so the
 // LoggedData is not valid.
 //
-// The parameter passed to this is allowed to be nil, but there may not be
-// any nils in the slice passed in.
+// The parameter passed to this is allowed to be nil.
 func timedInputToLoggedData(inputs []timedInput) (Consolidated, bool) {
 	if len(inputs) == 0 {
 		return Consolidated{}, false

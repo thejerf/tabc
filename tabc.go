@@ -8,9 +8,6 @@ This was originally written to take a stream of keystrokes over a terminal
 session in realtime, and assemble them into more meaningful chunks for
 logging purposes, but may be useful for other similar uses.
 
-Note this should NOT be used for network packet re-assembly. Use
-io.ReadFull or something similar.
-
 Use With Standard Interfaces
 
 This package provides io.Writer- and io.Reader-compatible wrapper objects
@@ -54,24 +51,11 @@ const (
 // Options defines the options for the Consolidator, and can be passed to
 // NewWriterOpt or NewReaderOpt.
 //
-// MaxBlockSize defines the largest message that will be emitted as a
-// single block. If set to zero, the consolidator will not take block size
-// into account for any decisions. // FIXME: Ensure this works
-//
-// Partitioner is a function that can examine the current input of the
-// consolidated logger, and emit messages early. For instance, this can be
-// used to emit based on newlines. Partitioners are NOT allowed to modify
-// the []byte passed in to them. By default the only partitioning done will
-// be based on the MaxBlockSize. newByteIdx indicates to your function the
-// first byte that is new for this invocation of the partitioner. Most
-// partitioner functions should only start their examination there, to
-// avoid turning into accidental O(n^2) functions as bytes come in.
-//
-// If you have neither a MaxBlockSize nor a Partitioner, you probably don't
-// want a Consolidator at all; the effect of such a consolidator would be
-// to gather all input in memory until the end of the stream, then dump it
-// all out at once, in which case you should just use io.ReadFull or a
-// bytes.Buffer, as appropriate.
+// Partitioner is a function that is given the internal state of the
+// current input, and can call the given output function as well as return
+// the new internal state of the consolidator. This can be used to do
+// things like break the input up according to your own constraints,
+// etc. See the examples in (SHOW).
 //
 // WaitInterval defines how long the consolidator will wait for more input,
 // before emitting what it has. If left zero, this will be set to the
@@ -81,16 +65,23 @@ const (
 // consolidator, and log it. If left nil, this will be set to use the
 // default Go logger package.
 //
+// OnFlush allows you to specify a function that will be called upon
+// successfully Flush()ing the Consolidator. This allows you to do things
+// like .Flush() or .Sync() the underlying .Writer if you need to. OnFlush
+// code should be aware that the underlying writer may be in an error
+// state.
+//
 // TimeShim allows you to override the mechanism used to obtain the current
 // time, and timers. If left nil, the consolidator will use the core time
 // package as you'd expect.
 type Options struct {
-	MaxBlockSize int
-	Partitioner  func(input []byte, newByteIdx) []int
+	OnFlush      func() error
 	WaitInterval time.Duration
 	Logger       func(string)
 	TimeShim
 }
+
+type Partitioner func([]timedInput, func(Consolidated) error) ([]timedInput, error)
 
 func (o *Options) setDefaults() {
 	if o.WaitInterval == 0 {
@@ -121,7 +112,10 @@ type consolidator struct {
 	Options
 
 	// outputFunc is what the consolidator uses to finally output the bytes.
-	outputFunc func([]byte, time.Time, []time.Duration) error
+	outputFunc func(Consolidated) error
+
+	Partitioner Partitioner
+	onFlush     func() error
 
 	inputC     chan inputMsg
 	closed     bool
@@ -144,8 +138,7 @@ type consolidator struct {
 
 	flushTrigger chan chan error
 
-	// What to close, if anything.
-	underlyingCloser io.Closer
+	underlying io.Writer
 }
 
 type consolidatorWriter struct {
@@ -159,22 +152,20 @@ type WriteCloseFlusher interface {
 	Flush() error
 }
 
-// New wraps the given io.WriteCloser with the code to do time-aware
+// New wraps the given io.Writer with the code to do time-aware
 // logging of what is written to the given securitylog.Session.
 //
 // While this function only requires an io.Writer, if the passed-in
 // parameter also conforms to io.Closer it will be .Closed when .Close is
 // called on the returned io.WriteCloser.
-func NewWriter(wc io.Writer) io.WriteCloser {
+func NewWriter(wc io.Writer, partitioner Partitioner) io.WriteCloser {
 	c := &consolidatorWriter{consolidator{
 		inputC:       make(chan inputMsg),
 		syncC:        make(chan struct{}),
 		flushTrigger: make(chan chan error),
+		Partitioner:  partitioner,
 	}}
 	c.Options.setDefaults()
-
-	closer, _ := wc.(io.Closer)
-	c.consolidator.underlyingCloser = closer
 
 	go c.consolidator.run()
 
@@ -210,8 +201,9 @@ func (c *consolidator) Close() error {
 		close(c.inputC)
 	}
 
-	if c.underlyingCloser != nil {
-		return c.underlyingCloser.Close()
+	closer, isCloser := c.underlying.(io.Closer)
+	if isCloser {
+		return closer.Close()
 	}
 	return nil
 }
@@ -261,11 +253,24 @@ func (c *consolidator) run() {
 			c.handleInput(nextInput.input)
 
 		case reply := <-c.flushTrigger:
-			reply <- c.doLog()
+			err := c.doLog()
+			if err != nil {
+				reply <- err
+				continue
+			}
+			if c.onFlush != nil {
+				err = c.onFlush()
+				reply <- err
+			} else {
+				reply <- nil
+			}
 
 		case <-timerC:
 			c.timer = nil
-			c.doLog()
+			err := c.doLog()
+			if err != nil {
+				c.errorState = err
+			}
 
 		// This allows us to synchronize on this loop, so the tests can
 		// safely know the previous requests were processed.
@@ -281,15 +286,20 @@ func (c *consolidator) sync() {
 }
 
 // handleInput is used within the consolidator's goroutine to handle
-// incoming input.
+// incoming input. Note this does not return an error; that is because when
+// this is executed, there's basically nowhere to send it.
 func (c *consolidator) handleInput(nextInput []byte) {
+	if c.errorState != nil {
+		return
+	}
+
 	// we want to do this last, regardless of what is going on.
 	// terminate the current timer, as it is out-of-date now.
 	// If there is any input still queued up to go out, start a new timer,
 	// but if it's empty, don't start a new timer.
 	defer func() {
 		// see the time pkg documentation on what this is in the Timer
-		// section, and why we don't use
+		// section
 		if c.timer != nil && !c.timer.Stop() {
 			<-c.timer.Channel()
 		}
@@ -301,53 +311,28 @@ func (c *consolidator) handleInput(nextInput []byte) {
 	}()
 
 	now := c.TimeShim.Now()
+	c.input = append(c.input, timedInput{nextInput, now})
 
-	input = append(input, nextInput...)
-
-	if c.Options.Partitioner != nil {
-		partitions := c.Options.Partitioner(...)
+	newState, err := c.Partitioner(c.input, c.outputFunc)
+	if err != nil {
+		c.errorState = err
+		return
 	}
-	beginIdx := 0
-	for idx, b := range nextInput {
-		
-		// First condition: Is this a newline?
-		if b == 10 || b == 13 {
-			// we have a newline!
-			// make a new timedInput with the rest of the line
-			lineTimedInput := timedInput{
-				input: nextInput[beginIdx : idx+1],
-				time:  now,
-			}
-
-			c.input = append(c.input, lineTimedInput)
-
-			c.doLog()
-			beginIdx = idx + 1
-		}
-
-		// Second condition: Would this push us over our limit for a single
-		// log message?
-		// FIXME
-	}
-
-	// Whatever's left over, turn it into a timedInput and append to the
-	// current list of timed inputs. In the common case, none of the above
-	// triggers, so this just becomes "append this keystroke to the list of
-	// inputs".
-	if beginIdx < len(nextInput) {
-		c.input = append(c.input,
-			timedInput{
-				input: nextInput[beginIdx:],
-				time:  now,
-			})
-	}
+	c.input = newState
 }
 
 // doLog will take the given timedInput and write it out to the log.
 func (c *consolidator) doLog() error {
-	// FIXME: Honor block size here
-	output := c.input
-	err := c.outputFunc(output)
-	c.input = c.input[:0]
-	return err
+	if c.errorState != nil {
+		return c.errorState
+	}
+
+	output, haveOutput := timedInputToLoggedData(c.input)
+	if haveOutput {
+		err := c.outputFunc(output)
+		c.input = c.input[:0]
+		c.errorState = err
+		return err
+	}
+	return nil
 }

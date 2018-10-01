@@ -3,7 +3,7 @@ tabc - Time-Aware Byte Consolidator
 
 [![Build Status](https://travis-ci.org/thejerf/tabc.png?branch=master)](https://travis-ci.org/thejerf/tabc)
 
-Current status: Still developing - completely unusable. Check back in 
+Current status: Still developing - completely unusable. Check back in
 a couple of weeks.
 
 This package provides code that accepts bytes input over time as `[]byte`,
@@ -32,14 +32,12 @@ compose io.Readers together without worrying about additional goroutines,
 you will need to consider that here. (It is likely that naive use is still
 correct, it is just something you need to bear in mind.)
 
-A couple of warnings for this package:
+Do Not Use This Package To...
+-----------------------------
 
- * This package is not the solution to gathering up potentially-broken-up
-   network packets. Use [io.ReadFull](https://golang.org/pkg/io/#ReadFull)
-   or something similar.
-
- * While this provides io.Reader- and io.Writer-based interfaces for bytes,
-   be aware that this is implemented with a separate goroutine
+ * ...gather potentially broken-up network packets: You should generally
+   use [io.ReadFull](https://golang.org/pkg/io/#ReadFull) or something
+   similar.
 
 Code Signing
 ------------
